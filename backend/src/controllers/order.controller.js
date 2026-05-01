@@ -15,30 +15,37 @@ async function createOrder(req, res) {
       return res.status(400).json({ error: 'Cart is empty' });
     }
 
-    for (const item of cartItems) {
-      if (!item.product.isActive) {
-        return res.status(400).json({ error: `Product "${item.product.name}" is no longer available` });
-      }
-      if (item.quantity > item.product.stock) {
-        return res.status(400).json({ error: `Insufficient stock for "${item.product.name}". Available: ${item.product.stock}` });
-      }
-    }
-
-    const orderItems = cartItems.map((item) => {
-      const { unitPrice, total } = calculateItemPrice(item.product, item.quantity, req.user.customerType);
-      return {
-        productId: item.productId,
-        quantity: item.quantity,
-        unitPrice,
-        total,
-      };
-    });
-
-    const subtotal = orderItems.reduce((sum, item) => sum + item.total, 0);
-    const discount = 0;
-    const total = subtotal - discount;
-
     const order = await prisma.$transaction(async (tx) => {
+      // Re-fetch products inside transaction for consistent reads
+      const productIds = cartItems.map((item) => item.productId);
+      const products = await tx.product.findMany({ where: { id: { in: productIds } } });
+      const productMap = Object.fromEntries(products.map((p) => [p.id, p]));
+
+      for (const item of cartItems) {
+        const product = productMap[item.productId];
+        if (!product || !product.isActive) {
+          throw new Error(`Product "${item.product.name}" is no longer available`);
+        }
+        if (item.quantity > product.stock) {
+          throw new Error(`Insufficient stock for "${product.name}". Available: ${product.stock}`);
+        }
+      }
+
+      const orderItems = cartItems.map((item) => {
+        const product = productMap[item.productId];
+        const { unitPrice, total } = calculateItemPrice(product, item.quantity, req.user.customerType);
+        return {
+          productId: item.productId,
+          quantity: item.quantity,
+          unitPrice,
+          total,
+        };
+      });
+
+      const subtotal = orderItems.reduce((sum, item) => sum + item.total, 0);
+      const discount = 0;
+      const total = subtotal - discount;
+
       const created = await tx.order.create({
         data: {
           orderNumber: generateOrderNumber(),
@@ -71,6 +78,9 @@ async function createOrder(req, res) {
     res.status(201).json(order);
   } catch (err) {
     console.error('Create order error:', err);
+    if (err.message.includes('stock') || err.message.includes('available')) {
+      return res.status(400).json({ error: err.message });
+    }
     res.status(500).json({ error: 'Failed to create order' });
   }
 }
@@ -164,13 +174,28 @@ async function updateOrderStatus(req, res) {
     if (deliveryAgentId) data.deliveryAgentId = deliveryAgentId;
     if (status === 'DELIVERED') data.paymentStatus = 'PAID';
 
-    const updated = await prisma.order.update({
-      where: { id: req.params.id },
-      data,
-      include: {
-        user: { select: { id: true, firstName: true, lastName: true, email: true } },
-        items: { include: { product: { select: { id: true, name: true } } } },
-      },
+    const updated = await prisma.$transaction(async (tx) => {
+      const result = await tx.order.update({
+        where: { id: req.params.id },
+        data,
+        include: {
+          user: { select: { id: true, firstName: true, lastName: true, email: true } },
+          items: { include: { product: { select: { id: true, name: true } } } },
+        },
+      });
+
+      // Restore stock when order is cancelled
+      if (status === 'CANCELLED') {
+        const orderItems = await tx.orderItem.findMany({ where: { orderId: order.id } });
+        for (const item of orderItems) {
+          await tx.product.update({
+            where: { id: item.productId },
+            data: { stock: { increment: item.quantity } },
+          });
+        }
+      }
+
+      return result;
     });
 
     res.json(updated);

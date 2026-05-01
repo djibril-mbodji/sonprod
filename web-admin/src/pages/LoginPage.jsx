@@ -5,7 +5,7 @@ import toast from 'react-hot-toast';
 import { Egg, Mail, Lock } from 'lucide-react';
 
 export default function LoginPage() {
-  const { login } = useAuth();
+  const { login, logout } = useAuth();
   const navigate = useNavigate();
   const [form, setForm] = useState({ email: '', password: '' });
   const [loading, setLoading] = useState(false);
@@ -17,8 +17,7 @@ export default function LoginPage() {
       const data = await login(form.email, form.password);
       if (data.user.role !== 'ADMIN') {
         toast.error('Admin access required');
-        localStorage.removeItem('token');
-        localStorage.removeItem('user');
+        logout();
         return;
       }
       toast.success('Welcome back!');
